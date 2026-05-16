@@ -20,7 +20,7 @@ use tokio::try_join;
 
 use super::{
     AnyQuery, BloomFilterQuery, LabelListQuery, MetricsCollector, SargableQuery, ScalarIndex,
-    SearchResult, TextQuery, TokenQuery,
+    SearchResult, TextQuery, TokenQuery, range_has_float_bound,
 };
 #[cfg(feature = "geo")]
 use super::{GeoQuery, RelationQuery};
@@ -303,12 +303,13 @@ impl ScalarQueryParser for SargableQueryParser {
             return None;
         }
         let query = SargableQuery::Range(low.clone(), high.clone());
+        let needs_recheck = self.needs_recheck || range_has_float_bound(low, high);
         Some(IndexedExpression::index_query_with_recheck(
             column.to_string(),
             self.index_name.clone(),
             self.index_type.clone(),
             Arc::new(query),
-            self.needs_recheck,
+            needs_recheck,
         ))
     }
 
@@ -369,12 +370,18 @@ impl ScalarQueryParser for SargableQueryParser {
             Operator::NotEq => SargableQuery::Equals(value.clone()),
             _ => unreachable!(),
         };
+        let needs_recheck = match &query {
+            SargableQuery::Range(lower, upper) => {
+                self.needs_recheck || range_has_float_bound(lower, upper)
+            }
+            _ => self.needs_recheck,
+        };
         Some(IndexedExpression::index_query_with_recheck(
             column.to_string(),
             self.index_name.clone(),
             self.index_type.clone(),
             Arc::new(query),
-            self.needs_recheck,
+            needs_recheck,
         ))
     }
 
@@ -1531,6 +1538,39 @@ impl ScalarIndexExpr {
         }
     }
 
+    fn nan_aware_range_to_expr(&self) -> Option<Expr> {
+        match self {
+            Self::Not(inner) => Some(Expr::Not(inner.nan_aware_range_to_expr()?.into())),
+            Self::And(lhs, rhs) => Some(
+                lhs.nan_aware_range_to_expr()?
+                    .and(rhs.nan_aware_range_to_expr()?),
+            ),
+            Self::Or(lhs, rhs) => Some(
+                lhs.nan_aware_range_to_expr()?
+                    .or(rhs.nan_aware_range_to_expr()?),
+            ),
+            Self::Query(_) => None,
+        }
+    }
+
+    fn exact_float_range_needs_recheck(&self) -> bool {
+        match self {
+            Self::Not(inner) => inner.exact_float_range_needs_recheck(),
+            Self::And(lhs, rhs) | Self::Or(lhs, rhs) => {
+                lhs.exact_float_range_needs_recheck() || rhs.exact_float_range_needs_recheck()
+            }
+            Self::Query(search) if search.index_type == "BTree" => search
+                .query
+                .as_any()
+                .downcast_ref::<SargableQuery>()
+                .is_some_and(|query| match query {
+                    SargableQuery::Range(lower, upper) => range_has_float_bound(lower, upper),
+                    _ => false,
+                }),
+            Self::Query(_) => false,
+        }
+    }
+
     pub fn needs_recheck(&self) -> bool {
         match self {
             Self::Not(inner) => inner.needs_recheck(),
@@ -2092,13 +2132,30 @@ impl PlannerIndexExt for Planner {
         if use_scalar_index {
             let indexed_expr = apply_scalar_indices(logical_expr.clone(), index_info)?;
             let mut skip_recheck = false;
+            let mut indexed_full_expr = None;
+            let mut exact_float_range_needs_recheck = false;
             if let Some(scalar_query) = indexed_expr.scalar_query.as_ref() {
-                skip_recheck = !scalar_query.needs_recheck();
+                let needs_recheck = scalar_query.needs_recheck();
+                exact_float_range_needs_recheck = scalar_query.exact_float_range_needs_recheck();
+                skip_recheck = !needs_recheck;
+                if needs_recheck && let Some(sargable_expr) = scalar_query.nan_aware_range_to_expr()
+                {
+                    indexed_full_expr = Some(match indexed_expr.refine_expr.clone() {
+                        Some(refine_expr) => sargable_expr.and(refine_expr),
+                        None => sargable_expr,
+                    });
+                }
             }
+            let full_expr = indexed_full_expr.or(Some(logical_expr));
+            let refine_expr = if exact_float_range_needs_recheck {
+                full_expr.clone()
+            } else {
+                indexed_expr.refine_expr
+            };
             Ok(FilterPlan {
                 index_query: indexed_expr.scalar_query,
-                refine_expr: indexed_expr.refine_expr,
-                full_expr: Some(logical_expr),
+                refine_expr,
+                full_expr,
                 skip_recheck,
             })
         } else {

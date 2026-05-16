@@ -20,15 +20,16 @@ use crate::scalar::registry::{
 };
 use crate::scalar::{
     BuiltinIndexType, CreatedIndex, SargableQuery, ScalarIndexParams, UpdateCriteria,
-    compute_next_prefix,
+    compute_next_prefix, range_has_finite_float_bound,
 };
-use datafusion::functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
-use datafusion_expr::Accumulator;
+use lance_arrow_stats::StatisticsAccumulator;
 use lance_core::cache::{LanceCache, WeakLanceCache};
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 
-use arrow_array::{ArrayRef, RecordBatch, UInt32Array, UInt64Array, new_empty_array};
+use arrow_array::{
+    ArrayRef, RecordBatch, UInt32Array, UInt64Array, new_empty_array, new_null_array,
+};
 use arrow_schema::{DataType, Field};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion_common::ScalarValue;
@@ -131,6 +132,21 @@ impl DeepSizeOf for ZoneMapIndex {
 }
 
 impl ZoneMapIndex {
+    fn scalar_is_nan(value: &ScalarValue) -> bool {
+        match value {
+            ScalarValue::Float16(Some(value)) => value.is_nan(),
+            ScalarValue::Float32(Some(value)) => value.is_nan(),
+            ScalarValue::Float64(Some(value)) => value.is_nan(),
+            _ => false,
+        }
+    }
+
+    fn zone_has_extrema(zone: &ZoneMapStatistics) -> bool {
+        !(zone.min.is_null()
+            || zone.max.is_null()
+            || Self::scalar_is_nan(&zone.min) && Self::scalar_is_nan(&zone.max))
+    }
+
     /// Evaluates whether a zone could potentially contain values matching the query
     /// For NaN, total order is used here
     /// reference: https://doc.rust-lang.org/std/primitive.f64.html#method.total_cmp
@@ -165,6 +181,10 @@ impl ZoneMapIndex {
                     return Ok(zone.nan_count > 0);
                 }
 
+                if !Self::zone_has_extrema(zone) {
+                    return Ok(false);
+                }
+
                 // Check if target is within the zone's range
                 // Handle the case where zone.max is NaN (zone contains both finite values and NaN)
                 let min_check = target >= &zone.min;
@@ -179,6 +199,14 @@ impl ZoneMapIndex {
             SargableQuery::Range(start, end) => {
                 // Zone overlaps with query range if there's any intersection between
                 // the zone's [min, max] and the query's range
+                if zone.nan_count > 0 && range_has_finite_float_bound(start, end) {
+                    return Ok(true);
+                }
+
+                if !Self::zone_has_extrema(zone) {
+                    return Ok(false);
+                }
+
                 let zone_min = &zone.min;
                 let zone_max = &zone.max;
 
@@ -300,6 +328,8 @@ impl ZoneMapIndex {
                             ScalarValue::Float16(Some(f)) => {
                                 if f.is_nan() {
                                     zone.nan_count > 0
+                                } else if !Self::zone_has_extrema(zone) {
+                                    false
                                 } else {
                                     value >= &zone.min && value <= &zone.max
                                 }
@@ -307,6 +337,8 @@ impl ZoneMapIndex {
                             ScalarValue::Float32(Some(f)) => {
                                 if f.is_nan() {
                                     zone.nan_count > 0
+                                } else if !Self::zone_has_extrema(zone) {
+                                    false
                                 } else {
                                     value >= &zone.min && value <= &zone.max
                                 }
@@ -314,11 +346,17 @@ impl ZoneMapIndex {
                             ScalarValue::Float64(Some(f)) => {
                                 if f.is_nan() {
                                     zone.nan_count > 0
+                                } else if !Self::zone_has_extrema(zone) {
+                                    false
                                 } else {
                                     value >= &zone.min && value <= &zone.max
                                 }
                             }
-                            _ => value >= &zone.min && value <= &zone.max,
+                            _ => {
+                                Self::zone_has_extrema(zone)
+                                    && value >= &zone.min
+                                    && value <= &zone.max
+                            }
                         }
                     }
                 }))
@@ -754,50 +792,34 @@ impl ZoneMapIndexBuilder {
 /// trainer takes care of chunking and fragment boundaries.
 struct ZoneMapProcessor {
     data_type: DataType,
-    min: MinAccumulator,
-    max: MaxAccumulator,
-    null_count: u32,
-    nan_count: u32,
+    statistics: StatisticsAccumulator,
 }
 
 impl ZoneMapProcessor {
     fn new(data_type: DataType) -> Result<Self> {
-        let min = MinAccumulator::try_new(&data_type)?;
-        let max = MaxAccumulator::try_new(&data_type)?;
         Ok(Self {
+            statistics: StatisticsAccumulator::new(&data_type),
             data_type,
-            min,
-            max,
-            null_count: 0,
-            nan_count: 0,
         })
     }
 
-    fn count_nans(array: &ArrayRef) -> u32 {
-        match array.data_type() {
-            DataType::Float16 => {
-                let array = array
-                    .as_any()
-                    .downcast_ref::<arrow_array::Float16Array>()
-                    .unwrap();
-                array.values().iter().filter(|&&x| x.is_nan()).count() as u32
-            }
-            DataType::Float32 => {
-                let array = array
-                    .as_any()
-                    .downcast_ref::<arrow_array::Float32Array>()
-                    .unwrap();
-                array.values().iter().filter(|&&x| x.is_nan()).count() as u32
-            }
-            DataType::Float64 => {
-                let array = array
-                    .as_any()
-                    .downcast_ref::<arrow_array::Float64Array>()
-                    .unwrap();
-                array.values().iter().filter(|&&x| x.is_nan()).count() as u32
-            }
-            _ => 0,
-        }
+    fn scalar_value_from_stat(
+        value: Option<&ArrayRef>,
+        data_type: &DataType,
+    ) -> Result<ScalarValue> {
+        let array = value
+            .cloned()
+            .unwrap_or_else(|| new_null_array(data_type, 1));
+        Ok(ScalarValue::try_from_array(&array, 0)?)
+    }
+
+    fn stat_count_to_u32(name: &str, value: u64) -> Result<u32> {
+        u32::try_from(value).map_err(|_| {
+            Error::invalid_input(format!(
+                "{} value {} exceeds the supported UInt32 range",
+                name, value
+            ))
+        })
     }
 }
 
@@ -805,28 +827,29 @@ impl ZoneProcessor for ZoneMapProcessor {
     type ZoneStatistics = ZoneMapStatistics;
 
     fn process_chunk(&mut self, array: &ArrayRef) -> Result<()> {
-        self.null_count += array.null_count() as u32;
-        self.nan_count += Self::count_nans(array);
-        self.min.update_batch(std::slice::from_ref(array))?;
-        self.max.update_batch(std::slice::from_ref(array))?;
+        self.statistics.update(array)?;
         Ok(())
     }
 
     fn finish_zone(&mut self, bound: ZoneBound) -> Result<Self::ZoneStatistics> {
+        let statistics = self.statistics.statistics();
         Ok(ZoneMapStatistics {
-            min: self.min.evaluate()?,
-            max: self.max.evaluate()?,
-            null_count: self.null_count,
-            nan_count: self.nan_count,
+            min: Self::scalar_value_from_stat(
+                statistics.min.as_ref().map(|scalar| scalar.as_array()),
+                &self.data_type,
+            )?,
+            max: Self::scalar_value_from_stat(
+                statistics.max.as_ref().map(|scalar| scalar.as_array()),
+                &self.data_type,
+            )?,
+            null_count: Self::stat_count_to_u32("null_count", statistics.null_count)?,
+            nan_count: Self::stat_count_to_u32("nan_count", statistics.nan_count.unwrap_or(0))?,
             bound,
         })
     }
 
     fn reset(&mut self) -> Result<()> {
-        self.min = MinAccumulator::try_new(&self.data_type)?;
-        self.max = MaxAccumulator::try_new(&self.data_type)?;
-        self.null_count = 0;
-        self.nan_count = 0;
+        self.statistics.reset();
         Ok(())
     }
 }
@@ -1360,10 +1383,9 @@ mod tests {
         let query = SargableQuery::Equals(ScalarValue::Float32(Some(1000.0)));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
-        // Since zones contain NaN values, their max will be NaN, so they will be included
-        // as potential matches for any finite target (false positive, but acceptable for zone maps)
-        let mut expected = RowAddrTreeMap::new();
-        expected.insert_range(0..500);
+        // NaN values are tracked separately from min/max, so finite values outside
+        // the finite zone ranges can still be pruned.
+        let expected = RowAddrTreeMap::new();
         assert_eq!(result, SearchResult::at_most(expected));
 
         // Test range query that should include finite values
@@ -1373,9 +1395,10 @@ mod tests {
         );
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
-        // Should match the first three zones since they contain values in the range [0, 250]
+        // Float range queries are conservative around NaN because zone maps track
+        // only a NaN count and not signed NaN ordering.
         let mut expected = RowAddrTreeMap::new();
-        expected.insert_range(0..300);
+        expected.insert_range(0..500);
         assert_eq!(result, SearchResult::at_most(expected));
 
         // Test IsIn query with NaN and finite values
@@ -1398,8 +1421,8 @@ mod tests {
         );
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
-        // Since zones contain NaN values, their max will be NaN, so they will be included
-        // as potential matches for any range query (false positive, but acceptable for zone maps)
+        // Float range queries are conservative around NaN because zone maps track
+        // only a NaN count and not signed NaN ordering.
         let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..500);
         assert_eq!(result, SearchResult::at_most(expected));

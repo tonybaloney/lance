@@ -17,8 +17,7 @@ use std::fmt::Debug;
 use std::pin::Pin;
 use std::{any::Any, ops::Bound, sync::Arc};
 
-use datafusion_expr::Expr;
-use datafusion_expr::expr::ScalarFunction;
+use datafusion_expr::{Expr, expr::ScalarFunction};
 use deepsize::DeepSizeOf;
 use inverted::query::{FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, fill_fts_query_column};
 use lance_core::utils::mask::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
@@ -405,6 +404,48 @@ pub enum SargableQuery {
     /// Retrieve all row ids where the value matches LIKE 'prefix%' pattern
     /// This is used for both explicit LIKE expressions and starts_with() function calls
     LikePrefix(ScalarValue),
+}
+
+pub(crate) fn scalar_is_float_nan(value: &ScalarValue) -> Option<bool> {
+    match value {
+        ScalarValue::Float16(Some(value)) => Some(value.is_nan()),
+        ScalarValue::Float32(Some(value)) => Some(value.is_nan()),
+        ScalarValue::Float64(Some(value)) => Some(value.is_nan()),
+        ScalarValue::Float16(None) | ScalarValue::Float32(None) | ScalarValue::Float64(None) => {
+            Some(false)
+        }
+        _ => None,
+    }
+}
+
+fn bound_is_float(bound: &Bound<ScalarValue>) -> bool {
+    match bound {
+        Bound::Included(value) | Bound::Excluded(value) => scalar_is_float_nan(value).is_some(),
+        Bound::Unbounded => false,
+    }
+}
+
+fn bound_is_finite_float(bound: &Bound<ScalarValue>) -> bool {
+    match bound {
+        Bound::Included(value) | Bound::Excluded(value) => {
+            scalar_is_float_nan(value).is_some_and(|is_nan| !is_nan)
+        }
+        Bound::Unbounded => false,
+    }
+}
+
+pub(crate) fn range_has_float_bound(
+    lower: &Bound<ScalarValue>,
+    upper: &Bound<ScalarValue>,
+) -> bool {
+    bound_is_float(lower) || bound_is_float(upper)
+}
+
+pub(crate) fn range_has_finite_float_bound(
+    lower: &Bound<ScalarValue>,
+    upper: &Bound<ScalarValue>,
+) -> bool {
+    bound_is_finite_float(lower) || bound_is_finite_float(upper)
 }
 
 impl AnyQuery for SargableQuery {
